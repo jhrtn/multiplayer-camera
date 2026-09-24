@@ -19,6 +19,7 @@
   #start span { font-size: 10px; opacity: .5; }
   #hint, #toast { position: fixed; left: 0; right: 0; bottom: 22px; text-align: center; font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: #f4f1ea99; text-shadow: 0 1px 6px #000; pointer-events: none; }
   #toast { bottom: 45px; }
+  #debug { position: fixed; top: 10px; left: 10px; right: 10px; font-size: 10px; line-height: 1.6; color: #f4f1ea; text-shadow: 0 1px 4px #000; white-space: pre-wrap; pointer-events: none; }
   #status { position: fixed; inset: 0; display: grid; place-items: center; color: #f4f1ea80; letter-spacing: 0.08em; text-transform: uppercase; pointer-events: none; }
   #start .row { display: flex; gap: 8px; }
   input { font: inherit; color: inherit; background: #000b; border: 1px solid #f4f1ea50; padding: 10px 12px; width: 13em; pointer-events: auto; letter-spacing: 0.08em; }
@@ -41,9 +42,10 @@
   <span>your camera goes peer to peer, nowhere else · <button type="button" id="invite-button" style="padding:0;border:0;background:none;font-size:10px;text-decoration:underline">invite</button></span>
 </form>
 <div id="invite" hidden><div id="qr"></div><a id="invite-link"></a><div class="row"><button id="copy-button">copy link</button></div><span>scan to join · anywhere to close</span></div>
-<div id="hint" hidden>move to push · click for a wave · m mode · p preset · [ ] tiles · c clear · i invite</div>
+<div id="hint" hidden>move to push · click for a wave · m mode · p preset · [ ] tiles · c clear · i invite · d diagnostics</div>
 <div id="status" role="status">loading</div>
 <div id="toast" role="status" hidden></div>
+<div id="debug" hidden></div>
 <script type="module">
 /* ---- the camera grid, multiplayer. Everyone's camera is composited into one
    picture, which the camera project's tile physics then pushes around. Every
@@ -56,6 +58,8 @@
 // password itself for invite links. Both only exist inside the encrypted page
 const SECRET = '__ROOM_SECRET__';
 const INVITE = '__INVITE__';
+// optional TURN relays for networks that block direct connections, also from build.mjs
+const TURN = '__TURN__';
 const DEV = SECRET.includes('ROOM_SECRET');
 const query = new URLSearchParams(location.search);
 const ROOM = `${DEV ? 'dev' : SECRET}:${query.get('room') ?? 'main'}`;
@@ -727,6 +731,7 @@ async function main() {
     const k = e.key.toLowerCase();
     if (k === 'escape') { $('invite').hidden = true; return; }
     if (k === 'i') { showInvite(); return; }
+    if (k === 'd') { $('debug').hidden = !$('debug').hidden; return; }
     const seed = 1 + Math.floor(Math.random() * 16777215);
     if (k === 'm') {
       setLook({ mode: MODE_NAMES[(MODE_NAMES.indexOf(look.mode) + 1) % MODE_NAMES.length], seed });
@@ -774,8 +779,12 @@ async function main() {
       look.from = selfId;
       addSelf(video);
 
-      room = trystero.joinRoom({ appId: APP_ID, password: ROOM }, ROOM, {
-        onJoinError: () => toast('Could not reach someone. Their network may need a TURN server.'),
+      const turnConfig = Array.isArray(TURN) && TURN.length ? TURN : undefined;
+      room = trystero.joinRoom({ appId: APP_ID, password: ROOM, turnConfig }, ROOM, {
+        onJoinError: details => {
+          joinErrors.push(`${String(details?.peerId ?? '').slice(0, 6)} ${details?.error ?? 'join error'}`);
+          toast('Could not reach someone. Their network may need a TURN server.');
+        },
       });
       room.addStream(stream);
       const lookAction = room.makeAction('look');
@@ -825,6 +834,38 @@ async function main() {
     }
   };
   $('start').addEventListener('submit', e => { e.preventDefault(); join(); });
+
+  /* ---- diagnostics (d, or ?debug): which room, who's here, how each peer is connected.
+   host: same network · srflx: across the internet · relay: through TURN ---- */
+  const joinErrors = [];
+  if (query.has('debug')) $('debug').hidden = false;
+  const candidateTypes = async pc => {
+    try {
+      const stats = await pc.getStats();
+      for (const r of stats.values()) {
+        if (r.type === 'candidate-pair' && r.nominated && r.state === 'succeeded') {
+          return `${stats.get(r.localCandidateId)?.candidateType}→${stats.get(r.remoteCandidateId)?.candidateType}`;
+        }
+      }
+    } catch {}
+    return 'no route';
+  };
+  setInterval(async () => {
+    if ($('debug').hidden) return;
+    const lines = [
+      `room ${ROOM.slice(0, 6)} · me ${selfId.slice(0, 6)} · turn ${Array.isArray(TURN) && TURN.length ? 'on' : 'off'}`,
+      room ? '' : 'not joined',
+    ];
+    const peers = room ? room.getPeers() : {};
+    for (const [id, pc] of peers instanceof Map ? peers : Object.entries(peers)) {
+      const v = feeds.get(id)?.video;
+      const video = v ? `video ${v.videoWidth}×${v.videoHeight}` : 'no video';
+      lines.push(`${id.slice(0, 6)} ${names.get(id) || ''} · ${pc.connectionState} · ice ${pc.iceConnectionState} · ${await candidateTypes(pc)} · ${video}`);
+    }
+    if (room && !lines[2]) lines.push('no peers found yet');
+    lines.push(...joinErrors.slice(-4));
+    $('debug').textContent = lines.filter(Boolean).join('\n');
+  }, 1000);
 
   let saveNext = false;
   const save = () => canvas.toBlob(blob => {

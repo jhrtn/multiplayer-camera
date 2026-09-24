@@ -1,5 +1,6 @@
 # Builds the encrypted page and publishes it to GitHub Pages.
 # Needs a repository secret PAGE_PASSWORD, and Pages set to "GitHub Actions".
+# Optional TURN relay secrets: TURN_URLS, TURN_USERNAME, TURN_CREDENTIAL.
 name: pages
 on:
   push:
@@ -27,6 +28,9 @@ jobs:
       - run: npm run build
         env:
           PAGE_PASSWORD: ${{ secrets.PAGE_PASSWORD }}
+          TURN_URLS: ${{ secrets.TURN_URLS }}
+          TURN_USERNAME: ${{ secrets.TURN_USERNAME }}
+          TURN_CREDENTIAL: ${{ secrets.TURN_CREDENTIAL }}
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dist
