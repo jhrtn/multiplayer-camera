@@ -181,6 +181,14 @@ const UNIFORMS = /* wgsl */ `
   }
 `;
 
+// a tile the physics has brought back to rest at home
+const SETTLED = /* wgsl */ `
+  fn settled(t: u32) -> bool {
+    let s = tiles[t];
+    return length(s.pos - homeOf(t)) < u.cell * 0.5 && length(s.vel) < u.cell * 0.05;
+  }
+`;
+
 const HASH = /* wgsl */ `
   fn hash(x: u32) -> u32 {
     var h = x * 747796405u + 2891336453u;
@@ -307,13 +315,16 @@ const COMPUTE = /* wgsl */ `
 `;
 
 /* ---- mosaic: neighbouring cells swap tiles whenever that brings both closer
-   to where the physics wants them, so every cell always holds one tile ---- */
+   to where the physics wants them, so every cell always holds one tile.
+   This is how pushed tiles slide, and slide back ---- */
 const SWAP = /* wgsl */ `
   @group(0) @binding(0) var<uniform> u: U;
   @group(0) @binding(1) var<storage, read> tiles: array<Tile>;
   @group(0) @binding(2) var<storage, read_write> slots: array<u32>;   // cell -> tile
   @group(0) @binding(3) var<uniform> swapStep: vec4f;   // x: axis (0 rows, 1 columns), y: parity
+  @group(0) @binding(4) var<storage, read_write> where_: array<u32>;   // tile -> cell
   ${UNIFORMS}
+  ${SETTLED}
 
   fn cost(want: vec2f, at: vec2f) -> f32 {
     let d = (want - at) / u.cell;
@@ -342,6 +353,8 @@ const SWAP = /* wgsl */ `
 
     let ta = slots[a];
     let tb = slots[b];
+    // tiles at rest are left to the heal: swapping them only re-tangles the grid
+    if (settled(ta) && settled(tb)) { return; }
     let wa = tiles[ta].pos;
     let wb = tiles[tb].pos;
     let ca = homeOf(a);
@@ -349,7 +362,44 @@ const SWAP = /* wgsl */ `
     if (cost(wa, cb) + cost(wb, ca) < cost(wa, ca) + cost(wb, cb) - 1e-4) {
       slots[a] = tb;
       slots[b] = ta;
+      where_[tb] = a;
+      where_[ta] = b;
     }
+  }
+`;
+
+/* ---- heal: neighbour swaps can tangle, leaving tiles that no swap brings
+   closer. Once the tiles involved have come to rest, a cell now and then pulls
+   its own tile straight back, so the leftovers dissolve home one by one.
+   A coin per cell each round keeps the swaps apart: only cells whose coin
+   says pull may act, and they only push out tiles whose own cell's coin says
+   don't, so no two swaps share a cell or a tile ---- */
+const HEAL = /* wgsl */ `
+  @group(0) @binding(0) var<uniform> u: U;
+  @group(0) @binding(1) var<storage, read> tiles: array<Tile>;
+  @group(0) @binding(2) var<storage, read_write> slots: array<u32>;    // cell -> tile
+  @group(0) @binding(3) var<storage, read_write> where_: array<u32>;   // tile -> cell
+  @group(0) @binding(4) var<uniform> step: vec4f;   // x: round, y: chance a cell heals per round
+  ${UNIFORMS}
+  ${HASH}
+
+  ${SETTLED}
+
+  fn pulls(c: u32) -> bool { return (hash(c ^ hash(u32(step.x))) & 1u) == 1u; }
+
+  @compute @workgroup_size(64)
+  fn main(@builtin(global_invocation_id) id: vec3u) {
+    let c = id.x;
+    if (c >= u32(u.count) || !pulls(c)) { return; }
+    let t = slots[c];
+    if (t == c || pulls(t)) { return; }
+    let w = where_[c];   // the cell holding c's own tile
+    if (pulls(w) || !settled(t) || !settled(c)) { return; }
+    if (f32(hash(c + hash(u32(step.x) * 7919u)) >> 8u) / 16777216.0 >= step.y) { return; }
+    slots[c] = c;
+    slots[w] = t;
+    where_[c] = c;
+    where_[t] = w;
   }
 `;
 
@@ -482,6 +532,11 @@ async function main() {
   if (!adapter) return fail('No WebGPU adapter');
   const device = await adapter.requestDevice();
   device.lost.then(info => fail(`GPU lost: ${info.message}`));
+  // say so once, rather than dropping every frame in silence
+  let gpuError = false;
+  device.addEventListener('uncapturederror', e => {
+    if (!gpuError) { gpuError = true; console.error('WebGPU:', e.error.message); }
+  });
 
   const ctx = canvas.getContext('webgpu');
   const format = navigator.gpu.getPreferredCanvasFormat();
@@ -504,6 +559,7 @@ async function main() {
   });
   const physics = compute(COMPUTE);
   const swapper = compute(SWAP);
+  const healer = compute(HEAL);
   const compositePipe = render(device.createShaderModule({ code: COMPOSITE }), 'vs', 'fs', 'rgba8unorm', false);
   const tilePipe = render(device.createShaderModule({ code: TILES }), 'vs', 'fs', format, true);
   const overlayModule = device.createShaderModule({ code: OVERLAY });
@@ -528,6 +584,12 @@ async function main() {
   };
   const layerBufs = [0, 1].map(v => constant([v, 0, 0, 0]));
   const swapSteps = [[0, 0], [0, 1], [1, 0], [1, 1]].map(([axis, parity]) => constant([axis, parity, 0, 0]));
+  // physics runs in fixed 60 Hz steps, so every screen moves at the same pace
+  const STEP_MS = 1000 / 60;
+  const MAX_STEPS = 4;
+  // chance a stranded tile's cell pulls it home, per step: ~3 s on average
+  const HEAL_CHANCE = 0.04;
+  const healSteps = Array.from({ length: MAX_STEPS }, () => uniform(16));
   const sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
 
   const gridBind = device.createBindGroup({
@@ -546,7 +608,7 @@ async function main() {
   /* ---- layout: size the grid, centre it, give every cell a tile ---- */
   let W = 0, H = 0, dpr = 1, cell = 0, cols = 0, rows = 0, offX = 0, offY = 0, count = 0;
   let laidOut = '';
-  let picture, tileBuf, slotBuf, physicsBind, swapBinds, tileBinds;
+  let picture, tileBuf, slotBuf, whereBuf, physicsBind, swapBinds, healBinds, tileBinds;
 
   const layout = () => {
     W = innerWidth;
@@ -576,12 +638,25 @@ async function main() {
       init[i * 4 + 1] = offY + Math.floor(i / cols) * cell;
     }
     tileBuf?.destroy();
-    tileBuf = device.createBuffer({ size: init.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    tileBuf = device.createBuffer({ size: init.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
     device.queue.writeBuffer(tileBuf, 0, init);
 
     slotBuf?.destroy();
-    slotBuf = device.createBuffer({ size: count * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    slotBuf = device.createBuffer({ size: count * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
     device.queue.writeBuffer(slotBuf, 0, Uint32Array.from({ length: count }, (_, i) => i));
+    whereBuf?.destroy();
+    whereBuf = device.createBuffer({ size: count * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(whereBuf, 0, Uint32Array.from({ length: count }, (_, i) => i));
+    healBinds = healSteps.map(stepBuf => device.createBindGroup({
+      layout: healer.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: uniformBuf } },
+        { binding: 1, resource: { buffer: tileBuf } },
+        { binding: 2, resource: { buffer: slotBuf } },
+        { binding: 3, resource: { buffer: whereBuf } },
+        { binding: 4, resource: { buffer: stepBuf } },
+      ],
+    }));
     swapBinds = swapSteps.map(stepBuf => device.createBindGroup({
       layout: swapper.getBindGroupLayout(0),
       entries: [
@@ -589,6 +664,7 @@ async function main() {
         { binding: 1, resource: { buffer: tileBuf } },
         { binding: 2, resource: { buffer: slotBuf } },
         { binding: 3, resource: { buffer: stepBuf } },
+        { binding: 4, resource: { buffer: whereBuf } },
       ],
     }));
     physicsBind = device.createBindGroup({
@@ -950,10 +1026,12 @@ async function main() {
   }, 'image/png');
 
   /* ---- cursor motion, smoothed so messages, pointer events and frames needn't line up ---- */
+  // velocity is kept per 60 Hz step, whatever the display's frame rate
+  let perStep = 1;
   const track = (c, x, y, ease) => {
     const nx = c.seen ? c.x + (x - c.x) * ease : x;
     const ny = c.seen ? c.y + (y - c.y) * ease : y;
-    const dx = c.seen ? nx - c.x : 0, dy = c.seen ? ny - c.y : 0;
+    const dx = c.seen ? (nx - c.x) * perStep : 0, dy = c.seen ? (ny - c.y) * perStep : 0;
     c.x = nx; c.y = ny; c.seen = true;
     c.vx = c.vx * 0.75 + dx * 0.25;
     c.vy = c.vy * 0.75 + dy * 0.25;
@@ -976,9 +1054,31 @@ async function main() {
   };
 
   /* ---- frame ---- */
+  let lastFrame = performance.now(), stepDebt = 0, round = 0;
+  // dev only: read the grid state back, for checking the physics from the console
+  if (DEV) window.gridState = async () => {
+    const read = async (buf, Type) => {
+      const staging = device.createBuffer({ size: buf.size, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+      const enc = device.createCommandEncoder();
+      enc.copyBufferToBuffer(buf, 0, staging, 0, buf.size);
+      device.queue.submit([enc.finish()]);
+      await staging.mapAsync(GPUMapMode.READ);
+      const out = new Type(staging.getMappedRange().slice(0));
+      staging.destroy();
+      return out;
+    };
+    const [tiles, slots] = [await read(tileBuf, Float32Array), await read(slotBuf, Uint32Array)];
+    return { tiles, slots, count, cols, cell, offX, offY };
+  };
   const frame = () => {
     if (layoutKey() !== laidOut) layout();
     const now = performance.now();
+    const dt = Math.min(now - lastFrame, 100) || STEP_MS;
+    lastFrame = now;
+    perStep = STEP_MS / dt;
+    stepDebt += dt;
+    const steps = Math.min(MAX_STEPS, Math.floor(stepDebt / STEP_MS));
+    stepDebt = Math.min(stepDebt - steps * STEP_MS, STEP_MS);
 
     const list = ordered();
     people = roomLayout(Math.max(1, list.length), W, H);
@@ -1040,10 +1140,11 @@ async function main() {
     bp.end();
 
     const cp = enc.beginComputePass();
-    cp.setPipeline(physics);
-    cp.setBindGroup(0, physicsBind);
-    cp.dispatchWorkgroups(Math.ceil(count / 64));
-    if (look.mosaic) {
+    for (let k = 0; k < steps; k++) {
+      cp.setPipeline(physics);
+      cp.setBindGroup(0, physicsBind);
+      cp.dispatchWorkgroups(Math.ceil(count / 64));
+      if (!look.mosaic) continue;
       cp.setPipeline(swapper);
       for (let r = 0; r < look.shuffle; r++) {
         for (const bind of swapBinds) {
@@ -1051,6 +1152,10 @@ async function main() {
           cp.dispatchWorkgroups(Math.ceil(count / 2 / 64));
         }
       }
+      device.queue.writeBuffer(healSteps[k], 0, new Float32Array([round++ % 16777216, HEAL_CHANCE, 0, 0]));
+      cp.setPipeline(healer);
+      cp.setBindGroup(0, healBinds[k]);
+      cp.dispatchWorkgroups(Math.ceil(count / 64));
     }
     cp.end();
 

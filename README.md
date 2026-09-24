@@ -15,7 +15,7 @@ Open it in two tabs (or two browsers) to see yourself twice. `?fake=3` repeats y
 - **Grid / brush sliders** (bottom): tile size, and how hard and wide a cursor pushes. Shared with everyone.
 - **P:** preset (drift, the default; whirl; default). **[ ]:** tile size. **G:** gap. **C:** clear sources. **S:** save PNG.
 
-Mode, preset, tile size and sources are shared. Whoever changes one last wins, and newcomers get the current state. Cursors travel as (whose cell, where in it), so they land on the same face even when screens differ in shape. Physics runs on each screen from the same inputs. The pictures look alike, but they are not identical frame by frame.
+Mode, preset, tile size and sources are shared. Whoever changes one last wins, and newcomers get the current state. Cursors travel as (whose cell, where in it), so they land on the same face even when screens differ in shape. After a push, tiles slide back as the physics settles. The last tangled ones dissolve home one by one, over about 20 seconds. Physics runs at a fixed 60 steps per second on each screen, from the same inputs. The pictures look alike, but they are not identical frame by frame.
 
 ## How it connects
 
