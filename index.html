@@ -1,0 +1,1013 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="theme-color" content="#000" />
+<title>Multiplayer Camera</title>
+<style>
+  :root { color-scheme: dark; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; background: #000; color: #f4f1ea; overflow: hidden; }
+  body { touch-action: none; }
+  canvas { display: block; width: 100%; height: 100%; cursor: none; }
+  [hidden] { display: none !important; }
+  #start { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; pointer-events: none; }
+  button { font: inherit; color: inherit; background: #000b; border: 1px solid #f4f1ea50; padding: 10px 16px; cursor: pointer; pointer-events: auto; letter-spacing: 0.08em; text-transform: uppercase; }
+  button:focus-visible { outline: 1px solid #f4f1ea; outline-offset: 4px; }
+  button:disabled { opacity: .5; cursor: wait; }
+  #start span { font-size: 10px; opacity: .5; }
+  #hint, #toast { position: fixed; left: 0; right: 0; bottom: 22px; text-align: center; font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: #f4f1ea99; text-shadow: 0 1px 6px #000; pointer-events: none; }
+  #toast { bottom: 45px; }
+  #status { position: fixed; inset: 0; display: grid; place-items: center; color: #f4f1ea80; letter-spacing: 0.08em; text-transform: uppercase; pointer-events: none; }
+  #start .row { display: flex; gap: 8px; }
+  input { font: inherit; color: inherit; background: #000b; border: 1px solid #f4f1ea50; padding: 10px 12px; width: 13em; pointer-events: auto; letter-spacing: 0.08em; }
+  input::placeholder { color: #f4f1ea60; text-transform: uppercase; }
+  input:focus-visible { outline: 1px solid #f4f1ea; outline-offset: 4px; }
+  /* names sit on each person's cell in the room view */
+  #labels { position: fixed; inset: 0; pointer-events: none; }
+  #labels div { position: absolute; font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: #f4f1eacc; text-shadow: 0 1px 6px #000; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #invite { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; background: #000d; }
+  #invite svg { width: min(60vmin, 320px); height: auto; display: block; }
+  #invite a { color: #f4f1ea99; font-size: 10px; max-width: 90vw; overflow-wrap: anywhere; text-align: center; }
+  #invite span { font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: #f4f1ea80; }
+</style>
+</head>
+<body>
+<canvas id="stage" aria-label="Everyone's camera in one tiled grid. Move to push the tiles, click to drop a wave source. Everyone in the room pushes the same grid."></canvas>
+<div id="labels"></div>
+<form id="start" hidden>
+  <div class="row"><input id="name" maxlength="24" placeholder="your name" autocomplete="nickname" /><button id="join-button">join</button></div>
+  <span>your camera goes peer to peer, nowhere else · <button type="button" id="invite-button" style="padding:0;border:0;background:none;font-size:10px;text-decoration:underline">invite</button></span>
+</form>
+<div id="invite" hidden><div id="qr"></div><a id="invite-link"></a><div class="row"><button id="copy-button">copy link</button></div><span>scan to join · anywhere to close</span></div>
+<div id="hint" hidden>move to push · click for a wave · m mode · p preset · [ ] tiles · c clear · i invite</div>
+<div id="status" role="status">loading</div>
+<div id="toast" role="status" hidden></div>
+<script type="module">
+/* ---- the camera grid, multiplayer. Everyone's camera is composited into one
+   picture, which the camera project's tile physics then pushes around. Every
+   peer's cursor pushes, and wave sources are shared, so everyone plays with the
+   same grid. Feeds, cursors and settings travel peer to peer over WebRTC;
+   Trystero finds the other peers through public Nostr relays, so there's no
+   server of our own. ---- */
+
+// build.mjs swaps these for a key derived from the page password, and the
+// password itself for invite links. Both only exist inside the encrypted page
+const SECRET = '__ROOM_SECRET__';
+const INVITE = '__INVITE__';
+const DEV = SECRET.includes('ROOM_SECRET');
+const query = new URLSearchParams(location.search);
+const ROOM = `${DEV ? 'dev' : SECRET}:${query.get('room') ?? 'main'}`;
+const APP_ID = 'workshop-multiplayer-camera';
+// ?fake=3 repeats your feed as three extra people · ?test sends a generated feed, not the camera
+const FAKES = Math.min(15, Number(query.get('fake')) || 0);
+const TEST = query.has('test');
+
+const canvas = document.getElementById('stage');
+const $ = id => document.getElementById(id);
+const fail = msg => { $('status').hidden = false; $('status').textContent = msg; $('start').hidden = true; };
+const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+/* ---- the camera project's looks ---- */
+const DEFAULTS = {
+  density: 72, gap: 0, gridLines: 0.055, mosaic: true, shuffle: 2,
+  push: 32, reach: 0.1, carry: 0.15, swirl: 0, fullSpeed: 10,
+  spring: 0.07, damping: 0.86, fade: 0.55,
+  srcStrength: 3, srcRate: 0.5, srcWave: 6, srcReach: 0.14, srcSwirl: 0,
+};
+const PRESETS = {
+  default: DEFAULTS,
+  drift: {
+    density: 28, gap: 1, gridLines: 0.06, mosaic: true, shuffle: 2,
+    push: 120, reach: 0.6, carry: 0, swirl: 0, fullSpeed: 6,
+    spring: 0.01, damping: 0.57, fade: 1,
+    srcStrength: 6, srcRate: 0.3, srcWave: 8, srcReach: 0.5, srcSwirl: 0,
+  },
+  whirl: {
+    density: 246, gap: 1, gridLines: 0.06, mosaic: true, shuffle: 2,
+    push: 120, reach: 1.5, carry: 0.33, swirl: 3.1, fullSpeed: 1,
+    spring: 0.01, damping: 0.92, fade: 0,
+    srcStrength: 6, srcRate: 0.3, srcWave: 8, srcReach: 0.5, srcSwirl: 0,
+  },
+};
+
+/* ---- how the feeds share the picture ---- */
+// room: a camera each, with its name · weave: everyone full frame, each tile
+// from someone at random · patch: the same, in patches of 5 × 5 tiles
+const MODES = { room: 0, weave: 1, patch: 5 };
+const MODE_NAMES = Object.keys(MODES);
+
+/* ---- the shared state: the look, the mode and the wave sources. The highest
+   (v, from) wins, so peers converge whoever changed it last ---- */
+const MAX_SOURCES = 16;
+const MAX_POINTERS = 16;
+let look = { preset: 'default', ...DEFAULTS, mode: 'room', seed: 1, sources: [], v: 0, from: '' };
+const params = { mirror: true, cursor: true };
+
+/* ---- shared uniform block (104 bytes) ---- */
+const UNIFORMS = /* wgsl */ `
+  struct U {
+    res: vec2f,      // css px
+    off: vec2f,      // grid phase
+    cell: f32,
+    cols: f32,
+    count: f32,
+    inset: f32,
+    dpr: f32,
+    push: f32,
+    reach: f32,      // css px
+    carry: f32,
+    spring: f32,
+    damping: f32,
+    fade: f32,
+    gridLines: f32,
+    cursor: f32,
+    swirl: f32,
+    srcCount: f32,
+    srcStrength: f32,
+    srcRate: f32,    // waves per second
+    srcWave: f32,    // wavelength, in cells
+    srcReach: f32,   // css px
+    srcSwirl: f32,
+    mosaic: f32,     // 1: every cell holds exactly one tile
+    ptrCount: f32,
+  };
+  struct Tile { pos: vec2f, vel: vec2f };
+  // xy: centre, z: age in seconds
+  struct Sources { s: array<vec4f, ${MAX_SOURCES}> };
+  // everyone's cursor: vel is smoothed px / frame, energy 0 when still, ~1 on a fast drag
+  struct Ptr { pos: vec2f, vel: vec2f, energy: f32, alpha: f32, pad: vec2f };
+  struct Pointers { p: array<Ptr, ${MAX_POINTERS}> };
+
+  const INK = vec3f(244.0, 241.0, 234.0) / 255.0;
+  const TAU = 6.2831853;
+
+  fn homeOf(i: u32) -> vec2f {
+    let cols = u32(u.cols);
+    return u.off + vec2f(f32(i % cols), f32(i / cols)) * u.cell;
+  }
+  fn snapToGrid(p: vec2f) -> vec2f {
+    return round((p - u.off) / u.cell) * u.cell + u.off;
+  }
+  fn cellOf(p: vec2f) -> vec2f {
+    return floor((p - u.off) / u.cell) * u.cell + u.off;
+  }
+  fn perp(d: vec2f) -> vec2f {
+    return vec2f(-d.y, d.x);
+  }
+`;
+
+const HASH = /* wgsl */ `
+  fn hash(x: u32) -> u32 {
+    var h = x * 747796405u + 2891336453u;
+    h = ((h >> ((h >> 28u) + 4u)) ^ h) * 277803737u;
+    return (h >> 22u) ^ h;
+  }
+`;
+
+/* ---- composite: everyone into one picture. Drawn once per feed; each pixel
+   works out whose it is and the other feeds discard it ---- */
+const COMPOSITE = /* wgsl */ `
+  struct C {
+    size: vec2f,     // css px
+    grid: vec2f,     // cols, rows of people
+    cellSize: vec2f, // one person's cell, px
+    pitch: vec2f,    // cell plus gutter, px
+    origin: vec2f,   // top left of the first row, px
+    off: vec2f,      // tile grid phase, so woven tiles line up with the physics tiles
+    feed: f32,       // which feed this draw is
+    count: f32,      // feeds
+    mode: f32,       // 0: room, 1: woven tiles
+    weave: f32,      // woven tile size, px
+    aspect: f32,     // this feed's width / height
+    mirror: f32,
+    seed: f32,
+  };
+  @group(0) @binding(0) var<uniform> c: C;
+  @group(0) @binding(1) var samp: sampler;
+  @group(0) @binding(2) var feed: texture_external;
+  ${HASH}
+
+  @vertex
+  fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
+    let p = vec2f(f32((vi << 1u) & 2u), f32(vi & 2u));
+    return vec4f(p * 2.0 - 1.0, 0.0, 1.0);
+  }
+
+  @fragment
+  fn fs(@builtin(position) fp: vec4f) -> @location(0) vec4f {
+    let n = u32(c.count);
+    var owner: u32;
+    var q: vec2f;        // 0..1 across the region this feed is fitted to
+    var region: vec2f;   // that region, px
+
+    if (c.mode > 0.5) {
+      let tile = vec2u((fp.xy - c.off) / c.weave);
+      owner = hash(tile.x + hash(tile.y + hash(u32(c.seed)))) % n;
+      q = fp.xy / c.size;
+      region = c.size;
+    } else {
+      // must match roomLayout() in js: rows of cols, the last row centred
+      let cols = i32(c.grid.x);
+      let rows = i32(c.grid.y);
+      let row = i32(floor((fp.y - c.origin.y) / c.pitch.y));
+      if (row < 0 || row >= rows) { discard; }
+      let inRow = select(cols, i32(n) - cols * (rows - 1), row == rows - 1);
+      let rowX = c.origin.x + f32(cols - inRow) * c.pitch.x * 0.5;
+      let col = i32(floor((fp.x - rowX) / c.pitch.x));
+      if (col < 0 || col >= inRow) { discard; }
+      let local = fp.xy - vec2f(rowX + f32(col) * c.pitch.x, c.origin.y + f32(row) * c.pitch.y);
+      // the gutter between people stays dark
+      if (local.x >= c.cellSize.x || local.y >= c.cellSize.y) { discard; }
+      owner = u32(row * cols + col);
+      q = local / c.cellSize;
+      region = c.cellSize;
+    }
+
+    if (owner != u32(c.feed)) { discard; }
+    // each person mirrored in place, so everyone sees the same picture
+    if (c.mirror > 0.5) { q.x = 1.0 - q.x; }
+    let ra = region.x / region.y;
+    let scale = select(vec2f(ra / c.aspect, 1.0), vec2f(1.0, c.aspect / ra), ra > c.aspect);
+    return vec4f(textureSampleBaseClampToEdge(feed, samp, (q - 0.5) * scale + 0.5).rgb, 1.0);
+  }
+`;
+
+/* ---- physics: the camera project's spring / push, one thread per tile,
+   pushed by every cursor in the room ---- */
+const COMPUTE = /* wgsl */ `
+  @group(0) @binding(0) var<uniform> u: U;
+  @group(0) @binding(1) var<storage, read_write> tiles: array<Tile>;
+  @group(0) @binding(2) var<uniform> src: Sources;
+  @group(0) @binding(3) var<uniform> ptr: Pointers;
+  ${UNIFORMS}
+
+  @compute @workgroup_size(64)
+  fn main(@builtin(global_invocation_id) id: vec3u) {
+    let i = id.x;
+    if (i >= u32(u.count)) { return; }
+    var t = tiles[i];
+    let centre = t.pos + u.cell * 0.5;
+
+    // only a moving cursor disturbs the grid, so a resting one lets it heal
+    for (var k = 0u; k < u32(u.ptrCount); k++) {
+      let q = ptr.p[k];
+      if (q.energy <= 0.001) { continue; }
+      let d = centre - q.pos;
+      let dist = max(length(d), 0.001);
+      if (dist < u.reach) {
+        let falloff = pow(1.0 - dist / u.reach, 2.0);
+        let dir = d / dist;
+        t.vel += (dir + perp(dir) * u.swirl) * (falloff * u.push * q.energy);
+        t.vel += q.vel * falloff * u.carry;
+      }
+    }
+
+    for (var k = 0u; k < u32(u.srcCount); k++) {
+      let s = src.s[k];
+      let d = centre - s.xy;
+      let dist = max(length(d), 0.001);
+      if (dist < u.srcReach) {
+        let falloff = pow(1.0 - dist / u.srcReach, 2.0);
+        let dir = d / dist;
+        let wave = sin(TAU * (s.z * u.srcRate - dist / (u.cell * u.srcWave))) * min(s.z * 2.0, 1.0);
+        t.vel += (dir * wave + perp(dir) * u.srcSwirl) * (falloff * u.srcStrength);
+      }
+    }
+
+    t.vel += (homeOf(i) - t.pos) * u.spring;
+    t.vel *= u.damping;
+    t.pos += t.vel;
+    tiles[i] = t;
+  }
+`;
+
+/* ---- mosaic: neighbouring cells swap tiles whenever that brings both closer
+   to where the physics wants them, so every cell always holds one tile ---- */
+const SWAP = /* wgsl */ `
+  @group(0) @binding(0) var<uniform> u: U;
+  @group(0) @binding(1) var<storage, read> tiles: array<Tile>;
+  @group(0) @binding(2) var<storage, read_write> slots: array<u32>;   // cell -> tile
+  @group(0) @binding(3) var<uniform> swapStep: vec4f;   // x: axis (0 rows, 1 columns), y: parity
+  ${UNIFORMS}
+
+  fn cost(want: vec2f, at: vec2f) -> f32 {
+    let d = (want - at) / u.cell;
+    let d2 = dot(d, d);
+    return d2 + 0.1 * d2 * d2;
+  }
+
+  @compute @workgroup_size(64)
+  fn main(@builtin(global_invocation_id) id: vec3u) {
+    let cols = u32(u.cols);
+    let rows = u32(u.count) / cols;
+    let parity = u32(swapStep.y);
+    var a: u32;
+    var b: u32;
+    if (swapStep.x < 0.5) {
+      let perRow = (cols - parity) / 2u;
+      if (id.x >= rows * perRow) { return; }
+      a = (id.x / perRow) * cols + (id.x % perRow) * 2u + parity;
+      b = a + 1u;
+    } else {
+      let perCol = (rows - parity) / 2u;
+      if (id.x >= cols * perCol) { return; }
+      a = ((id.x / cols) * 2u + parity) * cols + id.x % cols;
+      b = a + cols;
+    }
+
+    let ta = slots[a];
+    let tb = slots[b];
+    let wa = tiles[ta].pos;
+    let wb = tiles[tb].pos;
+    let ca = homeOf(a);
+    let cb = homeOf(b);
+    if (cost(wa, cb) + cost(wb, ca) < cost(wa, ca) + cost(wb, cb) - 1e-4) {
+      slots[a] = tb;
+      slots[b] = ta;
+    }
+  }
+`;
+
+/* ---- tiles: instanced quads, drawn snapped to the grid, sampling their home
+   patch of the composite ---- */
+const TILES = /* wgsl */ `
+  @group(0) @binding(0) var<uniform> u: U;
+  @group(0) @binding(1) var<storage, read> tiles: array<Tile>;
+  @group(0) @binding(2) var samp: sampler;
+  @group(0) @binding(3) var picture: texture_2d<f32>;
+  @group(0) @binding(4) var<uniform> layer: vec4f;   // x: 0 = tiles at home, 1 = displaced
+  @group(0) @binding(5) var<storage, read> slots: array<u32>;
+  ${UNIFORMS}
+
+  struct VOut {
+    @builtin(position) pos: vec4f,
+    @location(0) uv: vec2f,
+    @location(1) alpha: f32,
+  };
+
+  @vertex
+  fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VOut {
+    var quad = array<vec2f, 6>(
+      vec2f(0, 0), vec2f(1, 0), vec2f(0, 1),
+      vec2f(0, 1), vec2f(1, 0), vec2f(1, 1),
+    );
+    var out: VOut;
+
+    let mosaic = u.mosaic > 0.5;
+    let home = select(homeOf(ii), homeOf(slots[ii]), mosaic);
+    let g = select(snapToGrid(tiles[ii].pos), homeOf(ii), mosaic);
+    let d = g - home;
+    let moved = dot(d, d) > 0.25;
+
+    if (select(moved != (layer.x > 0.5), layer.x > 0.5, mosaic)) {
+      out.pos = vec4f(2.0, 2.0, 0.0, 1.0);
+      return out;
+    }
+
+    let q = quad[vi];
+    let size = u.cell - 2.0 * u.inset;
+    let p = g + u.inset + q * size;
+    let src = home + u.inset + q * size;
+
+    out.uv = src / u.res;
+    out.pos = vec4f(2.0 * p.x / u.res.x - 1.0, 1.0 - 2.0 * p.y / u.res.y, 0.0, 1.0);
+    out.alpha = select(1.0, 1.0 - min(length(d) / u.cell / 14.0, u.fade), moved);
+    return out;
+  }
+
+  @fragment
+  fn fs(in: VOut) -> @location(0) vec4f {
+    return vec4f(textureSample(picture, samp, in.uv).rgb, in.alpha);
+  }
+`;
+
+/* ---- full-screen passes: the faint grid underneath, cursors and sources on top ---- */
+const OVERLAY = /* wgsl */ `
+  @group(0) @binding(0) var<uniform> u: U;
+  @group(0) @binding(1) var<uniform> src: Sources;
+  @group(0) @binding(2) var<uniform> ptr: Pointers;
+  ${UNIFORMS}
+
+  @vertex
+  fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
+    let p = vec2f(f32((vi << 1u) & 2u), f32(vi & 2u));
+    return vec4f(p * 2.0 - 1.0, 0.0, 1.0);
+  }
+
+  @fragment
+  fn grid(@builtin(position) fp: vec4f) -> @location(0) vec4f {
+    let k = (fp.xy / u.dpr - u.off) / u.cell;
+    let dist = abs(k - round(k)) * u.cell;
+    let on = min(dist.x, dist.y) < 0.5;
+    return vec4f(INK * select(0.0, u.gridLines, on), 1.0);
+  }
+
+  @fragment
+  fn overlay(@builtin(position) fp: vec4f) -> @location(0) vec4f {
+    let css = fp.xy / u.dpr;
+
+    // each source is a small square in its cell, breathing with its wave
+    for (var k = 0u; k < u32(u.srcCount); k++) {
+      let s = src.s[k];
+      let l = abs(css - (cellOf(s.xy) + u.cell * 0.5));
+      if (max(l.x, l.y) < max(1.5, u.cell * 0.16)) {
+        return vec4f(INK, 0.55 + 0.35 * sin(TAU * s.z * u.srcRate));
+      }
+    }
+
+    // every cursor outlines its cell; yours brighter than everyone else's
+    if (u.cursor < 0.5) { discard; }
+    for (var k = 0u; k < u32(u.ptrCount); k++) {
+      let q = ptr.p[k];
+      let l = css - cellOf(q.pos);
+      let edge = min(min(l.x, l.y), min(u.cell - l.x, u.cell - l.y));
+      if (edge >= 0.0 && edge <= 1.0) { return vec4f(INK, q.alpha); }
+    }
+    discard;
+    return vec4f(0.0);
+  }
+`;
+
+/* ---- the room: a 4:3 cell per person, the arrangement that shows them largest ---- */
+const FEED_ASPECT = 4 / 3;
+const roomLayout = (n, w, h) => {
+  const gutter = Math.max(4, Math.round(Math.min(w, h) * 0.012));
+  let best = null;
+  for (let cols = 1; cols <= n; cols++) {
+    const rows = Math.ceil(n / cols);
+    const cw = Math.min((w - gutter * (cols + 1)) / cols, ((h - gutter * (rows + 1)) / rows) * FEED_ASPECT);
+    if (!best || cw > best.cw) best = { cols, rows, cw };
+  }
+  const { cols, rows } = best;
+  const cw = Math.max(1, best.cw), ch = cw / FEED_ASPECT;
+  const px = cw + gutter, py = ch + gutter;
+  const ox = (w - (cols * px - gutter)) / 2, oy = (h - (rows * py - gutter)) / 2;
+  const inRow = r => (r === rows - 1 ? n - cols * (rows - 1) : cols);
+  // top left of person k's cell
+  const at = k => {
+    const r = Math.floor(k / cols), c = k % cols;
+    return [ox + (cols - inRow(r)) * px / 2 + c * px, oy + r * py];
+  };
+  return { n, cols, rows, cw, ch, px, py, ox, oy, at };
+};
+
+async function main() {
+  if (!navigator.gpu) return fail('WebGPU not available in this browser');
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) return fail('No WebGPU adapter');
+  const device = await adapter.requestDevice();
+  device.lost.then(info => fail(`GPU lost: ${info.message}`));
+
+  const ctx = canvas.getContext('webgpu');
+  const format = navigator.gpu.getPreferredCanvasFormat();
+  ctx.configure({ device, format, alphaMode: 'opaque' });
+
+  /* ---- pipelines ---- */
+  const blend = {
+    color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha' },
+    alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' },
+  };
+  const compute = (code) => device.createComputePipeline({
+    layout: 'auto',
+    compute: { module: device.createShaderModule({ code }), entryPoint: 'main' },
+  });
+  const render = (module, vs, fs, target, withBlend) => device.createRenderPipeline({
+    layout: 'auto',
+    vertex: { module, entryPoint: vs },
+    fragment: { module, entryPoint: fs, targets: [{ format: target, blend: withBlend ? blend : undefined }] },
+    primitive: { topology: 'triangle-list' },
+  });
+  const physics = compute(COMPUTE);
+  const swapper = compute(SWAP);
+  const compositePipe = render(device.createShaderModule({ code: COMPOSITE }), 'vs', 'fs', 'rgba8unorm', false);
+  const tilePipe = render(device.createShaderModule({ code: TILES }), 'vs', 'fs', format, true);
+  const overlayModule = device.createShaderModule({ code: OVERLAY });
+  const gridPipe = render(overlayModule, 'vs', 'grid', format, false);
+  const overlayPipe = render(overlayModule, 'vs', 'overlay', format, true);
+
+  const uniform = size => device.createBuffer({ size, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const uniformData = new Float32Array(28);
+  const uniformBuf = uniform(uniformData.byteLength);
+  const sourceData = new Float32Array(MAX_SOURCES * 4);
+  const sourceBuf = uniform(sourceData.byteLength);
+  const ptrData = new Float32Array(MAX_POINTERS * 8);
+  const ptrBuf = uniform(ptrData.byteLength);
+  // one composite uniform buffer per feed, since every feed draws in the same pass
+  const compData = new Float32Array(20);
+  const compBufs = [];
+  const compBuf = k => (compBufs[k] ??= uniform(compData.byteLength));
+  const constant = values => {
+    const buf = uniform(16);
+    device.queue.writeBuffer(buf, 0, new Float32Array(values));
+    return buf;
+  };
+  const layerBufs = [0, 1].map(v => constant([v, 0, 0, 0]));
+  const swapSteps = [[0, 0], [0, 1], [1, 0], [1, 1]].map(([axis, parity]) => constant([axis, parity, 0, 0]));
+  const sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
+
+  const gridBind = device.createBindGroup({
+    layout: gridPipe.getBindGroupLayout(0),
+    entries: [{ binding: 0, resource: { buffer: uniformBuf } }],
+  });
+  const overlayBind = device.createBindGroup({
+    layout: overlayPipe.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: uniformBuf } },
+      { binding: 1, resource: { buffer: sourceBuf } },
+      { binding: 2, resource: { buffer: ptrBuf } },
+    ],
+  });
+
+  /* ---- layout: size the grid, centre it, give every cell a tile ---- */
+  let W = 0, H = 0, dpr = 1, cell = 0, cols = 0, rows = 0, offX = 0, offY = 0, count = 0;
+  let laidOut = '';
+  let picture, tileBuf, slotBuf, physicsBind, swapBinds, tileBinds;
+
+  const layout = () => {
+    W = innerWidth;
+    H = innerHeight;
+    dpr = Math.min(devicePixelRatio || 1, 2);
+    canvas.width = Math.round(W * dpr);
+    canvas.height = Math.round(H * dpr);
+
+    cell = Math.max(3, Math.round(Math.min(W, H) / look.density)) + look.gap;
+    cols = Math.ceil(W / cell);
+    rows = Math.ceil(H / cell);
+    offX = (W - cols * cell) / 2;
+    offY = (H - rows * cell) / 2;
+    count = cols * rows;
+
+    // everyone's feeds, composited at css resolution: that's more than 640 × 480 cameras carry
+    picture?.destroy();
+    picture = device.createTexture({
+      size: [W, H],
+      format: 'rgba8unorm',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+
+    const init = new Float32Array(count * 4);
+    for (let i = 0; i < count; i++) {
+      init[i * 4]     = offX + (i % cols) * cell;
+      init[i * 4 + 1] = offY + Math.floor(i / cols) * cell;
+    }
+    tileBuf?.destroy();
+    tileBuf = device.createBuffer({ size: init.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(tileBuf, 0, init);
+
+    slotBuf?.destroy();
+    slotBuf = device.createBuffer({ size: count * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(slotBuf, 0, Uint32Array.from({ length: count }, (_, i) => i));
+    swapBinds = swapSteps.map(stepBuf => device.createBindGroup({
+      layout: swapper.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: uniformBuf } },
+        { binding: 1, resource: { buffer: tileBuf } },
+        { binding: 2, resource: { buffer: slotBuf } },
+        { binding: 3, resource: { buffer: stepBuf } },
+      ],
+    }));
+    physicsBind = device.createBindGroup({
+      layout: physics.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: uniformBuf } },
+        { binding: 1, resource: { buffer: tileBuf } },
+        { binding: 2, resource: { buffer: sourceBuf } },
+        { binding: 3, resource: { buffer: ptrBuf } },
+      ],
+    });
+    tileBinds = layerBufs.map(layerBuf => device.createBindGroup({
+      layout: tilePipe.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: uniformBuf } },
+        { binding: 1, resource: { buffer: tileBuf } },
+        { binding: 2, resource: sampler },
+        { binding: 3, resource: picture.createView() },
+        { binding: 4, resource: { buffer: layerBuf } },
+        { binding: 5, resource: { buffer: slotBuf } },
+      ],
+    }));
+    laidOut = layoutKey();
+  };
+  const layoutKey = () => `${innerWidth}x${innerHeight}@${Math.min(devicePixelRatio || 1, 2)}:${look.density}/${look.gap}`;
+
+  /* ---- people: id -> { id, video, name }, in the same order on every screen.
+   A peer appears as soon as they join; their video follows once it arrives ---- */
+  const feeds = new Map();
+  const names = new Map();   // names can arrive before or after the feed
+  let selfId = 'me', room = null, sendLook = null, sendCursor = null;
+  const ordered = () => [...feeds.values()].sort((a, b) => (a.id < b.id ? -1 : 1));
+  const ready = v => v && v.readyState >= 2 && v.videoWidth > 0;
+  const peopleCount = () => [...feeds.keys()].filter(id => !id.startsWith('~')).length;
+  const nameOf = f => f.id === selfId ? `${myName || 'you'} · you`
+    : f.id.startsWith('~') ? `${myName || 'you'} · echo`
+    : names.get(f.id) || 'someone';
+  const addSelf = video => {
+    feeds.set(selfId, { id: selfId, video });
+    for (let i = 1; i <= FAKES; i++) feeds.set(`~fake${i}`, { id: `~fake${i}`, video });
+  };
+
+  /* ---- shared positions. Screens differ in shape, so the room does too: a
+   position travels as (person, u, v) — whose cell, and where in it — and every
+   screen maps it back onto its own layout, landing on the same face ---- */
+  let people = roomLayout(1, 1, 1);
+  const toShared = (x, y) => {
+    if (look.mode !== 'room') return [0, x / W, y / H];
+    // the nearest cell, so the gutters still count as someone's
+    let best = 0, dist = Infinity;
+    for (let k = 0; k < people.n; k++) {
+      const [cx, cy] = people.at(k);
+      const d = Math.hypot(x - (cx + people.cw / 2), y - (cy + people.ch / 2));
+      if (d < dist) { dist = d; best = k; }
+    }
+    const [cx, cy] = people.at(best);
+    return [best, (x - cx) / people.cw, (y - cy) / people.ch];
+  };
+  const toLocal = ([k, u, v]) => {
+    if (look.mode !== 'room') return [u * W, v * H];
+    const [cx, cy] = people.at(Math.min(k, people.n - 1));
+    return [cx + u * people.cw, cy + v * people.ch];
+  };
+
+  /* ---- names on cells, in the room view ---- */
+  const labelEls = [];
+  const drawLabels = list => {
+    const show = look.mode === 'room' && list.length > 0;
+    list.forEach((f, k) => {
+      const el = labelEls[k] ??= $('labels').appendChild(document.createElement('div'));
+      const [x, y] = people.at(k);
+      const text = ready(f.video) ? nameOf(f) : `${nameOf(f)} · connecting`;
+      if (el.textContent !== text) el.textContent = text;
+      el.style.cssText = `left:${x + 8}px;top:${y + people.ch - 20}px;max-width:${people.cw - 16}px`;
+      el.hidden = !show;
+    });
+    for (let k = list.length; k < labelEls.length; k++) labelEls[k].hidden = true;
+  };
+
+  /* ---- invites: the link, with the password, as a link and a QR code ---- */
+  const inviteLink = () => {
+    const url = new URL(location.href);
+    url.searchParams.delete('fake'); url.searchParams.delete('test');
+    url.hash = DEV ? '' : INVITE;
+    return url.href;
+  };
+  const showInvite = async () => {
+    const link = inviteLink();
+    $('invite-link').textContent = link; $('invite-link').href = link;
+    $('invite').hidden = false;
+    if (/localhost|127\.0\.0\.1/.test(location.hostname)) toast('localhost only works on this machine: publish it to invite people');
+    try {
+      const { default: qrcode } = await import('https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/+esm');
+      const qr = qrcode(0, 'M'); qr.addData(link); qr.make();
+      const size = qr.getModuleCount();
+      let d = '';
+      for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) if (qr.isDark(y, x)) d += `M${x} ${y}h1v1h-1z`;
+      $('qr').innerHTML = `<svg viewBox="-2 -2 ${size + 4} ${size + 4}" shape-rendering="crispEdges" role="img" aria-label="QR code for the invite link"><rect x="-2" y="-2" width="${size + 4}" height="${size + 4}" fill="#f4f1ea"/><path d="${d}" fill="#000"/></svg>`;
+    } catch { $('qr').textContent = ''; }
+  };
+  $('invite-button').addEventListener('click', showInvite);
+  $('invite').addEventListener('click', e => {
+    if (e.target.closest('#copy-button, a')) return;
+    $('invite').hidden = true;
+  });
+  $('copy-button').addEventListener('click', async () => {
+    try { await navigator.clipboard.writeText(inviteLink()); toast('link copied'); }
+    catch { toast('Could not copy. Select the link instead.'); }
+  });
+
+  const newer = (a, b) => a.v > b.v || (a.v === b.v && a.from > b.from);
+  const setLook = change => {
+    look = { ...look, ...change, v: look.v + 1, from: selfId };
+    sendLook?.(look);
+  };
+  const receiveLook = remote => { if (newer(remote, look)) look = remote; };
+
+  /* ---- cursors: yours, and everyone else's eased toward their last message ---- */
+  const cursors = new Map();   // id -> { at: shared pos | null, x, y, vx, vy, seen, heard }
+  const cursorOf = id => {
+    if (!cursors.has(id)) cursors.set(id, { at: null, x: 0, y: 0, vx: 0, vy: 0, seen: false, heard: 0 });
+    return cursors.get(id);
+  };
+  const me = { x: 0, y: 0, active: false, dirty: false, sent: 0 };
+  canvas.addEventListener('pointermove', e => {
+    me.x = e.clientX; me.y = e.clientY; me.active = true; me.dirty = true;
+  }, { passive: true });
+  canvas.addEventListener('pointerleave', () => {
+    me.active = false;
+    sendCursor?.(null);
+  });
+
+  // click a cell to drop a source there; click it again to remove it
+  let press = null;
+  canvas.addEventListener('pointerdown', e => {
+    if (e.button === 0) press = { x: e.clientX, y: e.clientY };
+  });
+  canvas.addEventListener('pointerup', e => {
+    if (!press || Math.hypot(e.clientX - press.x, e.clientY - press.y) > 4) { press = null; return; }
+    press = null;
+    const cellOf = (x, y) => [Math.floor((x - offX) / cell), Math.floor((y - offY) / cell)];
+    const [cx, cy] = cellOf(e.clientX, e.clientY);
+    const hit = look.sources.findIndex(s => {
+      const [x, y] = toLocal(s.at);
+      const [sx, sy] = cellOf(x, y);
+      return sx === cx && sy === cy;
+    });
+    const sources = [...look.sources];
+    if (hit >= 0) sources.splice(hit, 1);
+    else {
+      if (sources.length === MAX_SOURCES) sources.shift();
+      sources.push({ at: toShared(offX + (cx + 0.5) * cell, offY + (cy + 0.5) * cell), born: Date.now() });
+    }
+    setLook({ sources });
+  });
+
+  addEventListener('keydown', e => {
+    if (e.metaKey || e.ctrlKey || e.altKey || e.target.closest?.('input')) return;
+    const k = e.key.toLowerCase();
+    if (k === 'escape') { $('invite').hidden = true; return; }
+    if (k === 'i') { showInvite(); return; }
+    const seed = 1 + Math.floor(Math.random() * 16777215);
+    if (k === 'm') {
+      setLook({ mode: MODE_NAMES[(MODE_NAMES.indexOf(look.mode) + 1) % MODE_NAMES.length], seed });
+      toast(look.mode);
+    } else if (k === 'r') setLook({ seed });
+    else if (k === 'p') {
+      const names = Object.keys(PRESETS);
+      const preset = names[(names.indexOf(look.preset) + 1) % names.length];
+      setLook({ preset, ...PRESETS[preset] });
+      toast(preset);
+    }
+    else if (k === ']') setLook({ density: Math.min(Math.round(look.density * 1.25), 300) });
+    else if (k === '[') setLook({ density: Math.max(Math.round(look.density / 1.25), 8) });
+    else if (k === 'g') setLook({ gap: [0, 1, 5][([0, 1, 5].indexOf(look.gap) + 1) % 3] });
+    else if (k === 'c') setLook({ sources: [] });
+    else if (k === 's') saveNext = true;
+  });
+
+  /* ---- joining ---- */
+  let myName = '';
+  try { $('name').value = localStorage.getItem('name') ?? ''; } catch {}
+  const join = async () => {
+    myName = $('name').value.trim().slice(0, 24);
+    try { localStorage.setItem('name', myName); } catch {}
+    $('join-button').disabled = true;
+    $('join-button').textContent = 'connecting…';
+    let stream;
+    try {
+      stream = TEST ? testStream() : await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 24 } }, audio: false,
+      });
+    } catch (err) {
+      $('join-button').disabled = false;
+      $('join-button').textContent = 'retry camera';
+      toast('Camera unavailable. It needs HTTPS or localhost, and permission.');
+      return;
+    }
+    const video = await playing(stream);
+    $('start').hidden = true;
+    hint();
+
+    try {
+      const trystero = await import('https://cdn.jsdelivr.net/npm/trystero@0.25.4/+esm');
+      selfId = trystero.selfId;
+      look.from = selfId;
+      addSelf(video);
+
+      room = trystero.joinRoom({ appId: APP_ID, password: ROOM }, ROOM, {
+        onJoinError: () => toast('Could not reach someone. Their network may need a TURN server.'),
+      });
+      room.addStream(stream);
+      const lookAction = room.makeAction('look');
+      const cursorAction = room.makeAction('cursor');
+      const helloAction = room.makeAction('hello');
+      const gone = new Set();
+      helloAction.onMessage = (hello, { peerId }) => names.set(peerId, String(hello?.name ?? '').slice(0, 24));
+      helloAction.send({ name: myName });
+      sendLook = (data, target) => lookAction.send(data, target ? { target } : undefined);
+      sendCursor = at => cursorAction.send(at);
+      lookAction.onMessage = data => receiveLook(data);
+      cursorAction.onMessage = (at, { peerId }) => {
+        const c = cursorOf(peerId);
+        c.at = at; c.heard = performance.now();
+        if (!at) c.seen = false;
+      };
+
+      room.onPeerJoin = id => {
+        gone.delete(id);
+        if (!feeds.has(id)) feeds.set(id, { id, video: null });
+        room.addStream(stream, { target: id });
+        helloAction.send({ name: myName }, { target: id });
+        // everyone offers their state; the newcomer keeps the newest
+        sendLook(look, id);
+      };
+      room.onPeerStream = async (remote, id) => {
+        const video = await playing(remote);
+        // they may have left while the video was starting
+        if (gone.has(id)) return;
+        feeds.set(id, { id, video });
+        toast(`${names.get(id) || 'someone'} joined · ${peopleCount()} here`);
+      };
+      room.onPeerLeave = id => {
+        const f = feeds.get(id);
+        if (f?.video) f.video.srcObject = null;
+        gone.add(id);
+        feeds.delete(id);
+        cursors.delete(id);
+        toast(`${names.get(id) || 'someone'} left · ${peopleCount()} here`);
+      };
+      addEventListener('pagehide', () => room.leave());
+      toast(DEV ? `dev room · ${ROOM}` : 'waiting for others');
+    } catch (err) {
+      console.error(err);
+      addSelf(video);
+      toast('Offline: could not reach the peer network.');
+    }
+  };
+  $('start').addEventListener('submit', e => { e.preventDefault(); join(); });
+
+  let saveNext = false;
+  const save = () => canvas.toBlob(blob => {
+    if (!blob) { toast('Export failed. Please try again.'); return; }
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `multiplayer-camera-${new Date().toISOString().replace(/[:.]/g, '-')}.png`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    toast('PNG exported');
+  }, 'image/png');
+
+  /* ---- cursor motion, smoothed so messages, pointer events and frames needn't line up ---- */
+  const track = (c, x, y, ease) => {
+    const nx = c.seen ? c.x + (x - c.x) * ease : x;
+    const ny = c.seen ? c.y + (y - c.y) * ease : y;
+    const dx = c.seen ? nx - c.x : 0, dy = c.seen ? ny - c.y : 0;
+    c.x = nx; c.y = ny; c.seen = true;
+    c.vx = c.vx * 0.75 + dx * 0.25;
+    c.vy = c.vy * 0.75 + dy * 0.25;
+    return Math.min(Math.hypot(c.vx, c.vy) / look.fullSpeed, 1.5);
+  };
+  const pointersNow = () => {
+    const out = [];
+    const mine = cursorOf(selfId);
+    if (me.active) out.push([mine, track(mine, me.x, me.y, 1), 0.6]);
+    else { mine.seen = false; mine.vx = mine.vy = 0; }
+    const now = performance.now();
+    for (const [id, c] of cursors) {
+      if (id === selfId) continue;
+      // a cursor that's gone quiet has left without saying so
+      if (!c.at || now - c.heard > 4000) { c.seen = false; continue; }
+      const [x, y] = toLocal(c.at);
+      out.push([c, track(c, x, y, 0.35), 0.35]);
+    }
+    return out.slice(0, MAX_POINTERS);
+  };
+
+  /* ---- frame ---- */
+  const frame = () => {
+    if (layoutKey() !== laidOut) layout();
+    const now = performance.now();
+
+    const list = ordered();
+    people = roomLayout(Math.max(1, list.length), W, H);
+    drawLabels(list);
+    if (me.dirty && sendCursor && now - me.sent > 33) {
+      me.dirty = false; me.sent = now;
+      sendCursor(toShared(me.x, me.y));
+    }
+
+    const pointers = reduced ? [] : pointersNow();
+    pointers.forEach(([c, energy, alpha], k) => ptrData.set([c.x, c.y, c.vx, c.vy, energy, alpha, 0, 0], k * 8));
+    device.queue.writeBuffer(ptrBuf, 0, ptrData);
+
+    const sources = reduced ? [] : look.sources.slice(-MAX_SOURCES);
+    sources.forEach((s, k) => sourceData.set([...toLocal(s.at), Math.max(0, (Date.now() - s.born) / 1000), 0], k * 4));
+    device.queue.writeBuffer(sourceBuf, 0, sourceData);
+
+    const short = Math.min(W, H);
+    uniformData.set([
+      W, H, offX, offY,
+      cell, cols, count, look.gap / 2,
+      dpr, look.push, look.reach * short, look.carry,
+      look.spring, look.damping, look.fade, look.gridLines,
+      params.cursor ? 1 : 0, look.swirl, sources.length, look.srcStrength,
+      look.srcRate, look.srcWave, look.srcReach * short, look.srcSwirl,
+      look.mosaic ? 1 : 0, pointers.length,
+    ]);
+    device.queue.writeBuffer(uniformBuf, 0, uniformData);
+
+    const enc = device.createCommandEncoder();
+
+    // everyone into one picture
+    const bp = enc.beginRenderPass({
+      colorAttachments: [{ view: picture.createView(), clearValue: [0, 0, 0, 1], loadOp: 'clear', storeOp: 'store' }],
+    });
+    bp.setPipeline(compositePipe);
+    const weave = MODES[look.mode] ?? 0;
+    list.forEach((f, k) => {
+      if (!ready(f.video)) return;
+      compData.set([
+        W, H, people.cols, people.rows, people.cw, people.ch, people.px, people.py,
+        people.ox, people.oy, offX, offY,
+        k, list.length, weave ? 1 : 0, Math.max(1, weave) * cell,
+        f.video.videoWidth / f.video.videoHeight, params.mirror ? 1 : 0, look.seed,
+      ]);
+      device.queue.writeBuffer(compBuf(k), 0, compData);
+      // external textures expire every frame, so their bind groups do too
+      bp.setBindGroup(0, device.createBindGroup({
+        layout: compositePipe.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: compBuf(k) } },
+          { binding: 1, resource: sampler },
+          { binding: 2, resource: device.importExternalTexture({ source: f.video }) },
+        ],
+      }));
+      bp.draw(3);
+    });
+    bp.end();
+
+    const cp = enc.beginComputePass();
+    cp.setPipeline(physics);
+    cp.setBindGroup(0, physicsBind);
+    cp.dispatchWorkgroups(Math.ceil(count / 64));
+    if (look.mosaic) {
+      cp.setPipeline(swapper);
+      for (let r = 0; r < look.shuffle; r++) {
+        for (const bind of swapBinds) {
+          cp.setBindGroup(0, bind);
+          cp.dispatchWorkgroups(Math.ceil(count / 2 / 64));
+        }
+      }
+    }
+    cp.end();
+
+    const rp = enc.beginRenderPass({
+      colorAttachments: [{ view: ctx.getCurrentTexture().createView(), clearValue: [0, 0, 0, 1], loadOp: 'clear', storeOp: 'store' }],
+    });
+    rp.setPipeline(gridPipe);
+    rp.setBindGroup(0, gridBind);
+    rp.draw(3);
+    if (list.length) {
+      rp.setPipeline(tilePipe);
+      for (const bind of tileBinds) {
+        rp.setBindGroup(0, bind);
+        rp.draw(6, count);
+      }
+    }
+    rp.setPipeline(overlayPipe);
+    rp.setBindGroup(0, overlayBind);
+    rp.draw(3);
+    rp.end();
+
+    device.queue.submit([enc.finish()]);
+    if (saveNext) { saveNext = false; save(); }
+    requestAnimationFrame(frame);
+  };
+
+  layout();
+  requestAnimationFrame(frame);
+  $('status').hidden = true;
+  $('start').hidden = false;
+}
+
+const playing = async stream => {
+  const video = document.createElement('video');
+  video.muted = true;
+  video.playsInline = true;
+  video.srcObject = stream;
+  await video.play().catch(() => {});
+  return video;
+};
+
+// a stand-in camera for testing: bands of colour drifting past, a hue per tab
+function testStream() {
+  const art = document.createElement('canvas'); art.width = 640; art.height = 480;
+  const c = art.getContext('2d');
+  const hue = Math.floor(Math.random() * 360);
+  const draw = t => {
+    for (let i = 0; i < 12; i++) {
+      c.fillStyle = `hsl(${(hue + i * 14) % 360} 60% ${25 + (i % 4) * 14}%)`;
+      c.fillRect(0, ((i * 40 + t / 20) % 520) - 40, 640, 40);
+    }
+    c.fillStyle = '#f4f1ea';
+    c.beginPath(); c.arc(320 + Math.sin(t / 900) * 160, 240, 70, 0, Math.PI * 2); c.fill();
+    requestAnimationFrame(draw);
+  };
+  requestAnimationFrame(draw);
+  return art.captureStream(24);
+}
+
+let toastTimer, hintTimer;
+function toast(text) {
+  $('toast').textContent = text; $('toast').hidden = false;
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => $('toast').hidden = true, 2800);
+}
+function hint() {
+  $('hint').hidden = false;
+  clearTimeout(hintTimer); hintTimer = setTimeout(() => $('hint').hidden = true, 5000);
+}
+
+main().catch(err => { console.error(err); fail(String(err?.message ?? err)); });
+</script>
+</body>
+</html>
