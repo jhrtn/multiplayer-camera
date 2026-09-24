@@ -11,6 +11,7 @@ Open it in two tabs (or two browsers) to see yourself twice. `?fake=3` repeats y
 
 - **Move:** push tiles. **Click:** drop a wave source; click it again to remove it.
 - **M:** room → weave (everyone full frame, each tile from someone at random) → patch. **R:** reshuffle the weave.
+- **Close room** (bottom, click twice): sends everyone back to the join screen with their camera off. Names are remembered.
 - **I:** invite: a QR code and the link. On the published page, the link carries the password.
 - **Grid / brush sliders** (bottom): tile size, and how hard and wide a cursor pushes. Shared with everyone.
 - **P:** preset (drift, the default; whirl; default). **[ ]:** tile size. **G:** gap. **C:** clear sources. **S:** save PNG.

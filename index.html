@@ -23,6 +23,7 @@
   #controls { position: fixed; left: 0; right: 0; bottom: 16px; display: flex; justify-content: center; gap: 28px; padding: 0 16px; font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: #f4f1ea99; text-shadow: 0 1px 6px #000; opacity: .55; transition: opacity .3s; }
   #controls:hover, #controls:focus-within { opacity: 1; }
   #controls label { display: flex; align-items: center; gap: 10px; }
+  #controls button { font-size: 10px; padding: 3px 8px; }
   #controls input[type=range] { -webkit-appearance: none; appearance: none; width: min(160px, 32vw); height: 20px; padding: 0; border: 0; background: none; cursor: pointer; }
   #controls input[type=range]::-webkit-slider-runnable-track { height: 1px; background: #f4f1ea80; }
   #controls input[type=range]::-moz-range-track { height: 1px; background: #f4f1ea80; }
@@ -54,6 +55,7 @@
 <div id="controls" hidden>
   <label>grid <input id="grid-size" type="range" min="0" max="100" step="1" aria-label="grid size" /></label>
   <label>brush <input id="brush" type="range" min="0" max="100" step="1" aria-label="brush strength" /></label>
+  <button type="button" id="close-button">close room</button>
 </div>
 <div id="hint" hidden>move to push · click for a wave · m mode · p preset · [ ] tiles · c clear · i invite · d diagnostics</div>
 <div id="status" role="status">loading</div>
@@ -848,12 +850,38 @@ async function main() {
   /* ---- joining ---- */
   let myName = '';
   try { $('name').value = localStorage.getItem('name') ?? ''; } catch {}
+  // after a close, the reload lands back here; say who closed it
+  try {
+    const closed = sessionStorage.getItem('closed');
+    if (closed !== null) { sessionStorage.removeItem('closed'); toast(closed ? `${closed} closed the room` : 'room closed'); }
+  } catch {}
+  let stream = null;
+  // leave, let go of the camera, and start over at the join screen. PageCrypt
+  // keeps the page unlocked for the session, so the reload skips the password
+  const closeRoom = by => {
+    try { sessionStorage.setItem('closed', by ?? ''); } catch {}
+    stream?.getTracks().forEach(t => t.stop());
+    room?.leave();
+    location.reload();
+  };
+  let sendClose = null, closeArmed = null;
+  // one click arms it, a second within 3 s closes it for everyone
+  $('close-button').addEventListener('click', () => {
+    if (!closeArmed) {
+      $('close-button').textContent = 'close for everyone?';
+      closeArmed = setTimeout(() => { closeArmed = null; $('close-button').textContent = 'close room'; }, 3000);
+      return;
+    }
+    clearTimeout(closeArmed);
+    sendClose?.({ name: myName });
+    // give the message a moment to leave before the connections go
+    setTimeout(() => closeRoom(myName), 300);
+  });
   const join = async () => {
     myName = $('name').value.trim().slice(0, 24);
     try { localStorage.setItem('name', myName); } catch {}
     $('join-button').disabled = true;
     $('join-button').textContent = 'connecting…';
-    let stream;
     try {
       stream = TEST ? testStream() : await navigator.mediaDevices.getUserMedia({
         // small is plenty: the tiles are bigger than the pixels, and it keeps far peers smooth
@@ -892,6 +920,9 @@ async function main() {
       const gone = new Set();
       helloAction.onMessage = (hello, { peerId }) => names.set(peerId, String(hello?.name ?? '').slice(0, 24));
       helloAction.send({ name: myName });
+      const closeAction = room.makeAction('close');
+      sendClose = data => closeAction.send(data);
+      closeAction.onMessage = (data, { peerId }) => closeRoom(String(data?.name || names.get(peerId) || '').slice(0, 24));
       sendLook = (data, target) => lookAction.send(data, target ? { target } : undefined);
       sendCursor = at => cursorAction.send(at);
       lookAction.onMessage = data => receiveLook(data);
