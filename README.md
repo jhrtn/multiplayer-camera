@@ -12,13 +12,14 @@ Open it in two tabs (or two browsers) to see yourself twice. `?fake=3` repeats y
 - **Move:** push tiles. **Click:** drop a wave source; click it again to remove it.
 - **M:** room → weave (everyone full frame, each tile from someone at random) → patch. **R:** reshuffle the weave.
 - **I:** invite: a QR code and the link. On the published page, the link carries the password.
-- **P:** preset (default, drift, whirl). **[ ]:** tile size. **G:** gap. **C:** clear sources. **S:** save PNG.
+- **Grid / brush sliders** (bottom): tile size, and how hard and wide a cursor pushes. Shared with everyone.
+- **P:** preset (drift, the default; whirl; default). **[ ]:** tile size. **G:** gap. **C:** clear sources. **S:** save PNG.
 
 Mode, preset, tile size and sources are shared. Whoever changes one last wins, and newcomers get the current state. Cursors travel as (whose cell, where in it), so they land on the same face even when screens differ in shape. Physics runs on each screen from the same inputs. The pictures look alike, but they are not identical frame by frame.
 
 ## How it connects
 
-There's no server of our own. [Trystero](https://github.com/dmotz/trystero) finds peers through public Nostr relays. Video, cursors and state then go peer to peer over WebRTC, encrypted by WebRTC itself. Every peer sends its feed to every other peer at 640 × 480. That works well for about six people.
+There's no server of our own. [Trystero](https://github.com/dmotz/trystero) finds peers through public Nostr relays. Video, cursors and state then go peer to peer over WebRTC, encrypted by WebRTC itself. Every peer sends its feed to every other peer at 480 × 360, 20 fps, capped at 300 kbps. When bandwidth is short, it drops resolution before framerate. That works well for about six people.
 
 Some networks, like strict corporate Wi‑Fi or some mobile carriers, block direct connections. Those peers need a TURN relay (`turnConfig` in `joinRoom`, e.g. Cloudflare's).
 

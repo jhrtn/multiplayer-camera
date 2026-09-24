@@ -17,8 +17,17 @@
   button:focus-visible { outline: 1px solid #f4f1ea; outline-offset: 4px; }
   button:disabled { opacity: .5; cursor: wait; }
   #start span { font-size: 10px; opacity: .5; }
-  #hint, #toast { position: fixed; left: 0; right: 0; bottom: 22px; text-align: center; font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: #f4f1ea99; text-shadow: 0 1px 6px #000; pointer-events: none; }
-  #toast { bottom: 45px; }
+  #hint, #toast { position: fixed; left: 0; right: 0; bottom: 58px; text-align: center; font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: #f4f1ea99; text-shadow: 0 1px 6px #000; pointer-events: none; }
+  #toast { bottom: 80px; }
+  /* the two everyday controls; everything else is on keys */
+  #controls { position: fixed; left: 0; right: 0; bottom: 16px; display: flex; justify-content: center; gap: 28px; padding: 0 16px; font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: #f4f1ea99; text-shadow: 0 1px 6px #000; opacity: .55; transition: opacity .3s; }
+  #controls:hover, #controls:focus-within { opacity: 1; }
+  #controls label { display: flex; align-items: center; gap: 10px; }
+  #controls input[type=range] { -webkit-appearance: none; appearance: none; width: min(160px, 32vw); height: 20px; padding: 0; border: 0; background: none; cursor: pointer; }
+  #controls input[type=range]::-webkit-slider-runnable-track { height: 1px; background: #f4f1ea80; }
+  #controls input[type=range]::-moz-range-track { height: 1px; background: #f4f1ea80; }
+  #controls input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 10px; height: 10px; margin-top: -4.5px; background: #f4f1ea; border: 0; }
+  #controls input[type=range]::-moz-range-thumb { width: 10px; height: 10px; background: #f4f1ea; border: 0; border-radius: 0; }
   #debug { position: fixed; top: 10px; left: 10px; right: 10px; font-size: 10px; line-height: 1.6; color: #f4f1ea; text-shadow: 0 1px 4px #000; white-space: pre-wrap; pointer-events: none; }
   #status { position: fixed; inset: 0; display: grid; place-items: center; color: #f4f1ea80; letter-spacing: 0.08em; text-transform: uppercase; pointer-events: none; }
   #start .row { display: flex; gap: 8px; }
@@ -42,6 +51,10 @@
   <span>your camera goes peer to peer, nowhere else · <button type="button" id="invite-button" style="padding:0;border:0;background:none;font-size:10px;text-decoration:underline">invite</button></span>
 </form>
 <div id="invite" hidden><div id="qr"></div><a id="invite-link"></a><div class="row"><button id="copy-button">copy link</button></div><span>scan to join · anywhere to close</span></div>
+<div id="controls" hidden>
+  <label>grid <input id="grid-size" type="range" min="0" max="100" step="1" aria-label="grid size" /></label>
+  <label>brush <input id="brush" type="range" min="0" max="100" step="1" aria-label="brush strength" /></label>
+</div>
 <div id="hint" hidden>move to push · click for a wave · m mode · p preset · [ ] tiles · c clear · i invite · d diagnostics</div>
 <div id="status" role="status">loading</div>
 <div id="toast" role="status" hidden></div>
@@ -106,7 +119,13 @@ const MODE_NAMES = Object.keys(MODES);
    (v, from) wins, so peers converge whoever changed it last ---- */
 const MAX_SOURCES = 16;
 const MAX_POINTERS = 16;
-let look = { preset: 'default', ...DEFAULTS, mode: 'room', seed: 1, sources: [], v: 0, from: '' };
+let look = { preset: 'drift', ...PRESETS.drift, brush: 50, mode: 'room', seed: 1, sources: [], v: 0, from: '' };
+// brush 0..100 scales the preset's push and reach together: 50 is the preset, each 25 doubles or halves
+const brushScale = () => 2 ** (((look.brush ?? 50) - 50) / 25);
+// the grid slider runs from big tiles to small, evenly on a log scale
+const DENSITY = [8, 240];
+const densityOf = t => Math.round(DENSITY[0] * (DENSITY[1] / DENSITY[0]) ** (t / 100));
+const sliderOf = d => Math.round(100 * Math.log(d / DENSITY[0]) / Math.log(DENSITY[1] / DENSITY[0]));
 const params = { mirror: true, cursor: true };
 
 /* ---- shared uniform block (104 bytes) ---- */
@@ -643,7 +662,7 @@ async function main() {
       const [x, y] = people.at(k);
       const text = ready(f.video) ? nameOf(f) : `${nameOf(f)} · connecting`;
       if (el.textContent !== text) el.textContent = text;
-      el.style.cssText = `left:${x + 8}px;top:${y + people.ch - 20}px;max-width:${people.cw - 16}px`;
+      el.style.cssText = `left:${x + 8}px;top:${y + 6}px;max-width:${people.cw - 16}px`;
       el.hidden = !show;
     });
     for (let k = list.length; k < labelEls.length; k++) labelEls[k].hidden = true;
@@ -727,7 +746,7 @@ async function main() {
   });
 
   addEventListener('keydown', e => {
-    if (e.metaKey || e.ctrlKey || e.altKey || e.target.closest?.('input')) return;
+    if (e.metaKey || e.ctrlKey || e.altKey || e.target.closest?.('input:not([type=range])')) return;
     const k = e.key.toLowerCase();
     if (k === 'escape') { $('invite').hidden = true; return; }
     if (k === 'i') { showInvite(); return; }
@@ -761,7 +780,8 @@ async function main() {
     let stream;
     try {
       stream = TEST ? testStream() : await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 24 } }, audio: false,
+        // small is plenty: the tiles are bigger than the pixels, and it keeps far peers smooth
+        video: { width: { ideal: 480 }, height: { ideal: 360 }, frameRate: { ideal: 20 } }, audio: false,
       });
     } catch (err) {
       $('join-button').disabled = false;
@@ -769,7 +789,10 @@ async function main() {
       toast('Camera unavailable. It needs HTTPS or localhost, and permission.');
       return;
     }
+    // favour smooth motion over sharp frames when the encoder has to choose
+    for (const track of stream.getVideoTracks()) track.contentHint = 'motion';
     const video = await playing(stream);
+    $('controls').hidden = false;
     $('start').hidden = true;
     hint();
 
@@ -835,6 +858,51 @@ async function main() {
   };
   $('start').addEventListener('submit', e => { e.preventDefault(); join(); });
 
+  /* ---- a bitrate cap on every feed we send. Everyone sends to everyone, so
+   uploads add up; far peers, often through a relay, get smoother video when
+   each feed stays small. Degrading resolution before framerate keeps motion ---- */
+  const tuned = new WeakSet();
+  const tune = async sender => {
+    const p = sender.getParameters();
+    if (!p.encodings?.length) return;   // not negotiated yet
+    Object.assign(p.encodings[0], { maxBitrate: 300_000, maxFramerate: 20 });
+    try { await sender.setParameters({ ...p, degradationPreference: 'maintain-framerate' }); }
+    catch { await sender.setParameters(p); }
+    tuned.add(sender);
+  };
+  setInterval(() => {
+    if (!room) return;
+    const peers = room.getPeers();
+    for (const [, pc] of peers instanceof Map ? peers : Object.entries(peers)) {
+      for (const sender of pc.getSenders()) {
+        if (sender.track?.kind === 'video' && !tuned.has(sender)) tune(sender).catch(() => {});
+      }
+    }
+  }, 2000);
+
+  /* ---- the sliders: shared like everything else in the look ---- */
+  let slideSent = 0;
+  const slide = (el, change) => {
+    el.addEventListener('input', () => {
+      el.dataset.sliding = '1';
+      const now = performance.now();
+      // apply locally at once, share at most ~10 times a second
+      if (now - slideSent > 100) { slideSent = now; setLook(change(el.valueAsNumber)); }
+      else Object.assign(look, change(el.valueAsNumber));
+    });
+    el.addEventListener('change', () => {
+      delete el.dataset.sliding;
+      setLook(change(el.valueAsNumber));
+    });
+  };
+  slide($('grid-size'), t => ({ density: densityOf(t) }));
+  slide($('brush'), b => ({ brush: b }));
+  // follow changes from anyone else, but never fight a slider being dragged
+  const syncSliders = () => {
+    if (!$('grid-size').dataset.sliding) $('grid-size').value = sliderOf(look.density);
+    if (!$('brush').dataset.sliding) $('brush').value = look.brush ?? 50;
+  };
+
   /* ---- diagnostics (d, or ?debug): which room, who's here, how each peer is connected.
    host: same network · srflx: across the internet · relay: through TURN ---- */
   const joinErrors = [];
@@ -844,7 +912,10 @@ async function main() {
       const stats = await pc.getStats();
       for (const r of stats.values()) {
         if (r.type === 'candidate-pair' && r.nominated && r.state === 'succeeded') {
-          return `${stats.get(r.localCandidateId)?.candidateType}→${stats.get(r.remoteCandidateId)?.candidateType}`;
+          const rtt = r.currentRoundTripTime ? ` · ${Math.round(r.currentRoundTripTime * 1000)} ms` : '';
+          let fps = '';
+          for (const q of stats.values()) if (q.type === 'inbound-rtp' && q.kind === 'video' && q.framesPerSecond) fps = ` · ${Math.round(q.framesPerSecond)} fps in`;
+          return `${stats.get(r.localCandidateId)?.candidateType}→${stats.get(r.remoteCandidateId)?.candidateType}${rtt}${fps}`;
         }
       }
     } catch {}
@@ -912,6 +983,7 @@ async function main() {
     const list = ordered();
     people = roomLayout(Math.max(1, list.length), W, H);
     drawLabels(list);
+    syncSliders();
     if (me.dirty && sendCursor && now - me.sent > 33) {
       me.dirty = false; me.sent = now;
       sendCursor(toShared(me.x, me.y));
@@ -929,7 +1001,7 @@ async function main() {
     uniformData.set([
       W, H, offX, offY,
       cell, cols, count, look.gap / 2,
-      dpr, look.push, look.reach * short, look.carry,
+      dpr, look.push * brushScale(), Math.min(look.reach * Math.sqrt(brushScale()), 1.5) * short, look.carry,
       look.spring, look.damping, look.fade, look.gridLines,
       params.cursor ? 1 : 0, look.swirl, sources.length, look.srcStrength,
       look.srcRate, look.srcWave, look.srcReach * short, look.srcSwirl,
